@@ -1,19 +1,20 @@
 package cz.cvut.fit.palicand.vocloud.ssl.utils
 
-import org.apache.spark.mllib.linalg.distributed.{BlockMatrix, MatrixEntry, CoordinateMatrix}
-import org.apache.spark.mllib.linalg.{SparseMatrix, DenseMatrix, Matrix}
-import breeze.linalg.{Matrix => BM, DenseMatrix => BDM, CSCMatrix => BSM}
+import breeze.linalg.{CSCMatrix => BSM, DenseMatrix => BDM, Matrix => BM}
+import org.apache.spark.Logging
+import org.apache.spark.mllib.linalg.distributed._
+import org.apache.spark.mllib.linalg.{DenseMatrix, Matrix, SparseMatrix}
 
 import scala.collection.mutable.ArrayBuffer
 
 /**
   * Created by palickaa on 10/03/16.
   */
-object MatrixUtils {
+object MatrixUtils extends Logging {
   def toBreeze(m: Matrix): BM[Double] = {
     m match {
       case dm: DenseMatrix =>
-        if (dm.isTransposed) {
+        if (!dm.isTransposed) {
           new BDM[Double](dm.numRows, dm.numCols, dm.values)
         } else {
           val breezeMatrix = new BDM[Double](dm.numCols, dm.numRows, dm.values)
@@ -51,14 +52,29 @@ object MatrixUtils {
       val rowStart = blockRowIndex.toLong * m.rowsPerBlock
       val colStart = blockColIndex.toLong * m.colsPerBlock
       val entryValues = new ArrayBuffer[MatrixEntry]()
-      val bmMat = toBreeze(mat)
+      val bmMat = toBreeze(mat).toDenseMatrix
       bmMat.foreachPair { case ((i, j), v) =>
-        if (j == 0.0)   entryValues.append(new MatrixEntry(rowStart + i, colStart + j, v))
-        else if (v != 0.0) entryValues.append(new MatrixEntry(rowStart + i, colStart + j, v))
+        entryValues.append(new MatrixEntry(rowStart + i, colStart + j, v))
       }
       entryValues
     }
     new CoordinateMatrix(entryRDD, m.numRows(), m.numCols())
   }
 
+
+  def hasOnlyValidElements(m: DistributedMatrix): Boolean = {
+    m match {
+      case blockM: BlockMatrix => blockM.blocks.filter {
+        case (_, mat) =>
+          mat.toArray.count {
+            v => v.isNaN || v.isInfinity
+          } > 0
+      }.count() == 0
+      case rowMatrix: IndexedRowMatrix => rowMatrix.rows.filter {
+        case IndexedRow(index, vec) =>
+          vec.toArray.foldLeft(false) { (acc, v) => acc || (v.isNaN || v.isInfinity)}
+      }.count() == 0
+      case _ => true
+    }
+  }
 }

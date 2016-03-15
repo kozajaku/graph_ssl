@@ -1,0 +1,7 @@
+{
+  "inputData": "/Users/palickaa/Documents/vocloud_import/votable_preprocess_test/out/part-00000",
+  "outputData": "out.csv",
+  "neighbourhoodKernel": "knn",
+  "kernelParameters": {"k": 5},
+  "method": "labelProp"
+}
