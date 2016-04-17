@@ -14,12 +14,18 @@ import org.apache.spark.mllib.linalg.distributed._
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.storage.StorageLevel
 import scala.annotation.tailrec
 
 /**
   * Created by palickaa on 08/03/16.
   */
 
+class  MyKNN extends KNN {
+  def setBufferSize(size: Double): MyKNN = {
+    set(bufferSize, size).asInstanceOf[MyKNN]
+  }
+}
 
 trait GraphParams extends Params {
   final val neighbourhoodKernel = new Param[String](this, "neighKernel", "Kernel to use for getting neighbourhors",
@@ -31,6 +37,63 @@ trait GraphParams extends Params {
 
   final val maxIterations = new IntParam(this, "maxIterations", "How long should we iterate")
   setDefault(maxIterations -> 100)
+}
+
+
+private[ml] trait KnnKernel extends Logging with Params {
+
+  final val bufferSize = new DoubleParam(this, "bufferSize", "",
+    ParamValidators.gt(0.0))
+  setDefault(bufferSize -> 100.0)
+
+  def setBufferSize(size: Double): KnnKernel = {
+    set(bufferSize, size).asInstanceOf[KnnKernel]
+  }
+
+  final val topTreeLeafSize = new IntParam(this, "topTreeLeafSize", "",
+    ParamValidators.gtEq(1))
+  setDefault(topTreeLeafSize -> 5)
+
+  def setTopTreeLeafSize(size: Int): KnnKernel = {
+    set(topTreeLeafSize, size).asInstanceOf[KnnKernel]
+  }
+
+  final val subTreeLeafSize = new IntParam(this, "subTreeLeafSize", "",
+    ParamValidators.gtEq(1))
+  setDefault(subTreeLeafSize -> 100)
+
+  def setSubTreeLeafSize(size: Int): KnnKernel = {
+    set(subTreeLeafSize, size).asInstanceOf[KnnKernel]
+  }
+
+
+  final val topTreeSize = new IntParam(this, "topTreeSize", "",
+    ParamValidators.gtEq(1))
+  setDefault(topTreeSize -> 1000)
+
+  def setTopTreeSize(size: Int): KnnKernel = {
+    set(topTreeSize, size).asInstanceOf[KnnKernel]
+  }
+
+  def knnKernel(dataset: DataFrame, featCol: String, distance: (Vector, Vector) => Double, k: Int): BlockMatrix = {
+    val dsSize = dataset.count()
+    val knn = new MyKNN().setFeaturesCol(featCol).setAuxCols(("rowNo" +: featCol +: Nil).toArray).setK(k).
+      setTopTreeLeafSize($(topTreeLeafSize)).
+      setSubTreeLeafSize($(subTreeLeafSize)).
+      setBufferSize($(bufferSize)).
+      setTopTreeSize($(topTreeSize))
+    val knnModel = knn.fit(dataset)
+    new CoordinateMatrix(knnModel.transform(dataset).select("rowNo", featCol, "neighbors").rdd.flatMap {
+      case (Row(rowIndex: Long, vec: Vector, neighbours: Seq[_])) =>
+        neighbours.flatMap { case (neighbourRow: Row) =>
+          //TODO FIND SMARTER WAY TO DO IT
+          val dist = distance(vec, neighbourRow.getAs[Vector](1)) + 0.0000001 //to fix an issue when we have distance == 0
+
+          MatrixEntry(rowIndex, neighbourRow.getLong(0), dist) :: MatrixEntry(neighbourRow.getLong(0), rowIndex, dist) :: Nil
+        }
+    }, dsSize, dsSize).toBlockMatrix(dsSize.toInt / dataset.rdd.partitions.length,
+      dsSize.toInt / dataset.rdd.partitions.length)
+  }
 }
 
 abstract class GraphClassifier(override val uid: String)
@@ -48,30 +111,46 @@ abstract class GraphClassifier(override val uid: String)
     set(neighbourhoodKernel, kernel).asInstanceOf[GraphClassifier]
   }
 
+  /*final val sampleSize = new Param[Array[Int]](this, "sampleSize", "",
+    ParamValidators.arrayLengthGt[Int](2))
+  setDefault(sampleSize -> (100 to 1000 by 100).toArray)
+
+  def setsampleSize(sizes: Array[Int]): GraphClassifier = {
+    set(sampleSize, sizes).asInstanceOf[GraphClassifier]
+  }*/
+
+
   protected def computeLabelProbabilities(distances: BlockMatrix, labels: BlockMatrix, numberOfLabeled: Long) : BlockMatrix
 
   override def train(dataset: DataFrame) : LabelPropagationModel = {
-    val labeledPoints = extractLabeledPoints(dataset)
+    logInfo(s"Dataset partitions: ${dataset.rdd.partitions.length}")
+    logInfo(s"Dataset size: ${dataset.count()}")
     val distances = $(neighbourhoodKernel) match {
-      case "knn" => {
-        knnKernel(dataset, $(featuresCol), Vectors.sqdist, $(kNeighbours)).cache()
-      }
+      case "knn" =>
+        knnKernel(dataset, $(featuresCol), Vectors.sqdist, $(kNeighbours))
     }
+    logInfo(s"Rows per block : ${distances.rowsPerBlock}, number of elements: ${distances.numRows()}")
     val encoder = new OneHotEncoder()
     encoder.setInputCol($(labelCol))
     encoder.setOutputCol("labelIndex")
     // setDropLast encodes the last label as a zero vector. Thus, if we store an unknown label as label number
     // (n_labels), then we get what we need.
     encoder.setDropLast(true)
+    val numberOfClasses = DataframeUtils.numberOfClasses(dataset, "label").toInt
     val labeledRows = DataframeUtils.numberOfLabeledRows(dataset, $(labelCol))
     logDebug(s"Number of labeled rows: $labeledRows")
+    val elementsPerBlock = (dataset.count() / dataset.rdd.partitions.length).toInt
     val toLabel = new IndexedRowMatrix(encoder.transform(dataset).select("rowNo", "labelIndex").rdd.map {
       case (Row(i: Long, v: Vector)) =>
         new IndexedRow(i, v.toDense)
-    }).toBlockMatrix().cache()
+    }, dataset.count(), numberOfClasses).toBlockMatrix(elementsPerBlock, numberOfClasses)
     val labels = computeLabelProbabilities(distances, toLabel, labeledRows)
-    new LabelPropagationModel(labeledPoints, distances, labels,
-      new DenseVector(MatrixUtils.blockToCoordinateMatrix(labels).toIndexedRowMatrix.rows.sortBy(_.index).map { row => row.vector.argmax.toDouble }.collect()),
+    new LabelPropagationModel(extractLabeledPoints(dataset),
+      distances,
+      labels,
+      MatrixUtils.blockToCoordinateMatrix(labels).toIndexedRowMatrix.rows.map {
+        row => (row.index, row.vector.argmax.toDouble)
+      },
       $(kNeighbours))
   }
 
@@ -101,24 +180,6 @@ abstract class GraphClassifier(override val uid: String)
   }
 }
 
-
-private[ml] trait KnnKernel extends Logging {
-  def knnKernel(dataset: DataFrame, featCol: String, distance: (Vector, Vector) => Double, k: Int): BlockMatrix = {
-    val dsSize = dataset.count()
-    val knn = new KNN().setFeaturesCol(featCol).setAuxCols(("rowNo" +: featCol +: Nil).toArray).setK(k).setTopTreeSize((0.5 * dsSize).ceil.toInt).setBufferSizeSampleSizes(Array(50, 100))
-    val knnModel = knn.fit(dataset)
-    new CoordinateMatrix(knnModel.transform(dataset).select("rowNo", featCol, "neighbors").rdd.flatMap {
-      case (Row(rowIndex: Long, vec: Vector, neighbours: Seq[_])) =>
-        neighbours.flatMap { case (neighbourRow: Row) =>
-          //TODO FIND SMARTER WAY TO DO IT
-          val dist = distance(vec, neighbourRow.getAs[Vector](1)) + 0.0000001 //to fix an issue when we have distance == 0
-
-          MatrixEntry(rowIndex, neighbourRow.getLong(0), dist) :: MatrixEntry(neighbourRow.getLong(0), rowIndex, dist) :: Nil
-        }
-    }).toBlockMatrix
-  }
-}
-
 final class LabelPropagationClassifier(override val uid: String)
   extends GraphClassifier(uid)  {
   def this() = this(Identifiable.randomUID("lpc"))
@@ -127,38 +188,33 @@ final class LabelPropagationClassifier(override val uid: String)
 
 
   override def computeLabelProbabilities(weights: BlockMatrix, labels: BlockMatrix, labeledPoints: Long): BlockMatrix = {
+
+    val oldLabelsRDD = labels.toIndexedRowMatrix().rows.filter { case IndexedRow(i, v) =>
+      i < labeledPoints
+    }.sortBy(_.index).persist(StorageLevel.MEMORY_AND_DISK_SER)
     @tailrec
     def labelPropagationRec(transitionMatrix: BlockMatrix, labels: BlockMatrix, iteration: Int): BlockMatrix = {
       if (iteration > $(maxIterations)) {
         return labels
       }
-      val oldLabelsRDD = labels.toIndexedRowMatrix.rows.sortBy(_.index).coalesce(32)
-      val newLabelsRDD = MatrixUtils.blockToCoordinateMatrix(transitionMatrix.multiply(labels)).toIndexedRowMatrix.rows.sortBy(_.index).coalesce(32)
-      val newLabels = new IndexedRowMatrix(oldLabelsRDD.filter { case IndexedRow(i, v) =>
-        i < labeledPoints
-      } ++
-        newLabelsRDD.filter { case IndexedRow(i, v) =>
+      val newLabelsRDD = MatrixUtils.blockToCoordinateMatrix(transitionMatrix.multiply(labels)).toIndexedRowMatrix.rows.sortBy(_.index)
+      val newLabels = new IndexedRowMatrix(oldLabelsRDD ++ newLabelsRDD.filter { case IndexedRow(i, v) =>
           i >= labeledPoints
-        }).toBlockMatrix()
+        }, labels.numRows(), labels.numCols().toInt).toBlockMatrix(labels.rowsPerBlock, labels.rowsPerBlock)
+      labels.blocks.unpersist() // we don't want to keep old labels in memory
       //assert(MatrixUtils.hasOnlyValidElements(newLabels))
       if (hasConverged(labels, newLabels, 0.001)) {
         return newLabels
       }
-      labelPropagationRec(transitionMatrix, newLabels.cache(), iteration + 1)
+      labelPropagationRec(transitionMatrix, newLabels.persist(StorageLevel.MEMORY_AND_DISK_SER), iteration + 1)
     }
 
 
-    val rowD = new IndexedRowMatrix(MatrixUtils.blockToCoordinateMatrix(weights).toIndexedRowMatrix.rows.map { (row) =>
-
+    val transitionMatrix = new IndexedRowMatrix(weights.toIndexedRowMatrix.rows.map { (row) =>
       //assert(!inverse.isNaN)
-      IndexedRow(row.index, Vectors.sparse(row.vector.size, Array(row.index.toInt), Array(1.0 / row.vector.toArray.sum)))
-    })
-
-    //assert(MatrixUtils.hasOnlyValidElements(rowD))
-
-    val d = rowD.toBlockMatrix
-    //assert(MatrixUtils.hasOnlyValidElements(d))
-    val transitionMatrix = d.multiply(weights).cache()
+      IndexedRow(row.index, Vectors.sparse(row.vector.size, Array(row.index.toInt), Array(1.0 / row.vector.toSparse.values.sum)))
+    }, weights.numRows(), weights.numCols().toInt).toBlockMatrix(weights.rowsPerBlock, weights.colsPerBlock).
+      multiply(weights).persist(StorageLevel.MEMORY_AND_DISK_SER)
     //assert(MatrixUtils.hasOnlyValidElements(transitionMatrix))
     labelPropagationRec(transitionMatrix, labels, 0)
   }
@@ -166,8 +222,12 @@ final class LabelPropagationClassifier(override val uid: String)
 
 }
 
-class LabelPropagationModel(override val uid: String, val points: RDD[LabeledPoint], val weightMatrix: BlockMatrix, val labelWeights: BlockMatrix,
-                            val labels: Vector, val k: Int) extends ProbabilisticClassificationModel[Vector, LabelPropagationModel]
+class LabelPropagationModel(override val uid: String,
+                            val points: RDD[LabeledPoint],
+                            val weightMatrix: BlockMatrix,
+                            val labelWeights: BlockMatrix,
+                            val labels: RDD[(Long, Double)],
+                            val k: Int) extends ProbabilisticClassificationModel[Vector, LabelPropagationModel]
   with Serializable with KnnKernel with GraphParams {
   override def numClasses: Int = {
     labelWeights.numCols().toInt
@@ -198,7 +258,8 @@ class LabelPropagationModel(override val uid: String, val points: RDD[LabeledPoi
 
   override def copy(extra: ParamMap): LabelPropagationModel = defaultCopy(extra)
 
-  def this(points: RDD[LabeledPoint], weightMatrix: BlockMatrix, labelWeights: BlockMatrix, labels: Vector, k: Int) = this(Identifiable.randomUID("lpcm"), points,
+  def this(points: RDD[LabeledPoint], weightMatrix: BlockMatrix, labelWeights: BlockMatrix, labels: RDD[(Long, Double)],
+           k: Int) = this(Identifiable.randomUID("lpcm"), points,
     weightMatrix, labelWeights, labels, k)
 
   override protected def raw2probabilityInPlace(rawPrediction: Vector): Vector = {

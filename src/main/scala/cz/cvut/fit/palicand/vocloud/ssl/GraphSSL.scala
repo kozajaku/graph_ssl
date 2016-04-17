@@ -10,6 +10,7 @@ import cz.cvut.fit.palicand.vocloud.ssl.utils.DataframeUtils
 import org.apache.spark.mllib.linalg.{VectorUDT, Vectors, Vector}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Row, SQLContext}
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.{Logging, SparkConf, SparkContext}
 import org.json4s._
 import org.json4s.native.JsonMethods._
@@ -29,9 +30,11 @@ case class CmdArgs(configFile : File = new File(".")) {
   *
   */
 case class Config(inputData: String, outputData: String, neighbourhoodKernel: String, kernelParameters: KnnKernelParameters,
-                  method: String, methodParameters: Option[LabelSpreadParameters])
+                  method: String, iterations: Int, partitions: Int, methodParameters: Option[LabelSpreadParameters],
+                  ratio: Double)
 
-case class KnnKernelParameters(k: Int)
+case class KnnKernelParameters(k: Int, bufferSize: Double, topTreeSize: Int, topTreeLeafSize: Int,
+                               subTreeLeafSize: Int)
 
 case class LabelSpreadParameters(alpha: Double)
 
@@ -46,7 +49,7 @@ object GraphSSL extends Logging {
     parser.parse(args, CmdArgs()) match {
       case Some(config) => {
         logDebug("test")
-        val conf = new SparkConf().setAppName("Graph-SSL").setMaster("local")
+        val conf = new SparkConf().setAppName("Graph-SSL").set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         val sc = new SparkContext(conf)
         val jsonConfig = parse(file2JsonInput(config.configFile)).extract[Config]
         val sqlContext = new SQLContext(sc)
@@ -54,8 +57,8 @@ object GraphSSL extends Logging {
           .format("com.databricks.spark.csv")
           .option("header", "false") // Use first line of all files as header
           .option("inferSchema", "true") // Automatically infer data types
-          .load(jsonConfig.inputData)
-        val rowSchema = StructType(StructField("rowNo", LongType) :: StructField("spectra", StringType) ::
+          .load(jsonConfig.inputData).repartition(jsonConfig.partitions)
+        val rowSchema = StructType(StructField("rowNo", LongType) :: StructField("spectrum", StringType) ::
           StructField("features", new VectorUDT()) :: StructField("label", DoubleType) ::  Nil)
         val transformed = sqlContext.createDataFrame(df.rdd.zipWithIndex.map { case (row, i) =>
           val buffer = ArrayBuffer[Double]()
@@ -63,20 +66,22 @@ object GraphSSL extends Logging {
             buffer.append(row.getDouble(j))
           }
           Row.fromSeq(i :: row.getString(0) :: Vectors.dense(buffer.toArray) :: row.getInt(row.length - 1).toDouble :: Nil)
-        }, rowSchema)
-        val numberOfLabels = DataframeUtils.numberOfClasses(transformed, "label")
+        }, rowSchema).repartition(jsonConfig.partitions)
+        val sampled = sqlContext.createDataFrame(transformed.where("label != -1").unionAll(transformed.where("label = -1").sample(withReplacement = false,
+          jsonConfig.ratio)).rdd.zipWithIndex.map {case (row@Row(_, name, features, label), i) => Row.fromSeq(i :: name :: features :: label :: Nil)}, rowSchema).orderBy("rowNo")
+        val numberOfLabels = DataframeUtils.numberOfClasses(sampled, "label")
         logDebug(s"${transformed.select("label").distinct().collect()}")
-        val dataset = sqlContext.createDataFrame(transformed.map { case r@Row(rowNo: Long, spectra: String, vector: Vector, label: Double) =>
+        val dataset = sqlContext.createDataFrame(sampled.map { case r@Row(rowNo: Long, spectra: String, vector: Vector, label: Double) =>
           if (label == -1) {
             Row.fromSeq(rowNo :: spectra :: vector :: numberOfLabels.toDouble :: Nil)
           } else {
             Row.fromSeq(rowNo :: spectra :: vector :: label :: Nil)
           }
-        }, rowSchema).cache()
-        logDebug(s"Size of dataset: ${dataset.count}")
-        logInfo(s"Parameters: $jsonConfig")
+        }, rowSchema).repartition(jsonConfig.partitions).persist(StorageLevel.MEMORY_ONLY_SER)
+        logInfo(s"Size of dataset: ${dataset.count}")
         val clf : GraphClassifier = jsonConfig.method match {
           case "LabelPropagation" => new LabelPropagationClassifier()
+
           case "LabelSpreading" =>
             jsonConfig.methodParameters match {
               case Some(param) =>  val lsc = new LabelSpreadingClassifier()
@@ -87,12 +92,15 @@ object GraphSSL extends Logging {
           case _ => throw new UnsupportedOperationException(s"Method ${jsonConfig.method} is not supported.")
         }
 
-        clf.setLabelCol("label").setFeaturesCol("features").setKNeighbours(jsonConfig.kernelParameters.k)
+        clf.setLabelCol("label").setFeaturesCol("features").setKNeighbours(jsonConfig.kernelParameters.k).
+          setMaxIterations(jsonConfig.iterations).setTopTreeLeafSize(jsonConfig.kernelParameters.topTreeLeafSize).
+          setSubTreeLeafSize(jsonConfig.kernelParameters.subTreeLeafSize).
+          setTopTreeSize(jsonConfig.kernelParameters.topTreeSize)
+        clf.setBufferSize(jsonConfig.kernelParameters.bufferSize)
         val model = clf.fit(dataset)
-        logDebug(s"Number of labels ${model.labels.size}")
-        logInfo(s"Weights:\n${model.labelWeights.toLocalMatrix()}")
-        logInfo(s"Labels:\n${model.labels}")
-
+        val names = dataset.select("rowNo", "spectrum").map{ case Row(rowNo: Long, name: String) =>
+          (rowNo, name)
+        }.join(model.labels).map {case (rowNo, (name, label)) => (name, label)}.saveAsTextFile(jsonConfig.outputData)
 
       }
       case None =>
