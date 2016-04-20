@@ -91,8 +91,8 @@ private[ml] trait KnnKernel extends Logging with Params {
 
           MatrixEntry(rowIndex, neighbourRow.getLong(0), dist) :: MatrixEntry(neighbourRow.getLong(0), rowIndex, dist) :: Nil
         }
-    }, dsSize, dsSize).toBlockMatrix(dsSize.toInt / dataset.rdd.partitions.length,
-      dsSize.toInt / dataset.rdd.partitions.length)
+    }, dsSize, dsSize).toBlockMatrix(128,
+      128)
   }
 }
 
@@ -143,7 +143,7 @@ abstract class GraphClassifier(override val uid: String)
     val toLabel = new IndexedRowMatrix(encoder.transform(dataset).select("rowNo", "labelIndex").rdd.map {
       case (Row(i: Long, v: Vector)) =>
         new IndexedRow(i, v.toDense)
-    }, dataset.count(), numberOfClasses).toBlockMatrix(elementsPerBlock, numberOfClasses)
+    }, dataset.count(), numberOfClasses).toBlockMatrix(128, 128)
     val labels = computeLabelProbabilities(distances, toLabel, labeledRows)
     new LabelPropagationModel(extractLabeledPoints(dataset),
       distances,
@@ -191,30 +191,31 @@ final class LabelPropagationClassifier(override val uid: String)
 
     val oldLabelsRDD = labels.toIndexedRowMatrix().rows.filter { case IndexedRow(i, v) =>
       i < labeledPoints
-    }.sortBy(_.index).persist(StorageLevel.MEMORY_AND_DISK_SER)
+    }.persist(StorageLevel.MEMORY_ONLY_SER)
+
     @tailrec
     def labelPropagationRec(transitionMatrix: BlockMatrix, labels: BlockMatrix, iteration: Int): BlockMatrix = {
       if (iteration > $(maxIterations)) {
         return labels
       }
-      val newLabelsRDD = MatrixUtils.blockToCoordinateMatrix(transitionMatrix.multiply(labels)).toIndexedRowMatrix.rows.sortBy(_.index)
+      val newLabelsRDD = MatrixUtils.blockToCoordinateMatrix(transitionMatrix.multiply(labels)).toIndexedRowMatrix.rows
       val newLabels = new IndexedRowMatrix(oldLabelsRDD ++ newLabelsRDD.filter { case IndexedRow(i, v) =>
           i >= labeledPoints
-        }, labels.numRows(), labels.numCols().toInt).toBlockMatrix(labels.rowsPerBlock, labels.rowsPerBlock)
-      labels.blocks.unpersist() // we don't want to keep old labels in memory
+        }, labels.numRows(), labels.numCols().toInt).toBlockMatrix(128, 128).persist(StorageLevel.MEMORY_ONLY_SER)
       //assert(MatrixUtils.hasOnlyValidElements(newLabels))
       if (hasConverged(labels, newLabels, 0.001)) {
         return newLabels
       }
-      labelPropagationRec(transitionMatrix, newLabels.persist(StorageLevel.MEMORY_AND_DISK_SER), iteration + 1)
+      labelPropagationRec(transitionMatrix, newLabels, iteration + 1)
     }
 
 
     val transitionMatrix = new IndexedRowMatrix(weights.toIndexedRowMatrix.rows.map { (row) =>
       //assert(!inverse.isNaN)
-      IndexedRow(row.index, Vectors.sparse(row.vector.size, Array(row.index.toInt), Array(1.0 / row.vector.toSparse.values.sum)))
-    }, weights.numRows(), weights.numCols().toInt).toBlockMatrix(weights.rowsPerBlock, weights.colsPerBlock).
-      multiply(weights).persist(StorageLevel.MEMORY_AND_DISK_SER)
+      val sum = 1.0 / row.vector.toSparse.values.sum
+      val divided = row.vector.toSparse.values.map {_ / sum}
+      new IndexedRow(row.index, new SparseVector(row.vector.size, row.vector.toSparse.indices, divided))
+    }, weights.numRows(), weights.numCols().toInt).toBlockMatrix(128, 128).persist(StorageLevel.MEMORY_ONLY_SER)
     //assert(MatrixUtils.hasOnlyValidElements(transitionMatrix))
     labelPropagationRec(transitionMatrix, labels, 0)
   }

@@ -8,7 +8,6 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Row, SQLContext}
 import org.scalatest.{Matchers, FlatSpec}
-import org.scalatest.prop.Checkers
 
 /**
   * Created by palickaa on 11/03/16.
