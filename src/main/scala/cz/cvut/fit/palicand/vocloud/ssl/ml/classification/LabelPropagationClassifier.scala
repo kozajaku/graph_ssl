@@ -91,8 +91,8 @@ private[ml] trait KnnKernel extends Logging with Params {
 
           MatrixEntry(rowIndex, neighbourRow.getLong(0), dist) :: MatrixEntry(neighbourRow.getLong(0), rowIndex, dist) :: Nil
         }
-    }, dsSize, dsSize).toBlockMatrix(128,
-      128)
+    }, dsSize, dsSize).toBlockMatrix(1024,
+      1024)
   }
 }
 
@@ -143,13 +143,13 @@ abstract class GraphClassifier(override val uid: String)
     val toLabel = new IndexedRowMatrix(encoder.transform(dataset).select("rowNo", "labelIndex").rdd.map {
       case (Row(i: Long, v: Vector)) =>
         new IndexedRow(i, v.toDense)
-    }, dataset.count(), numberOfClasses).toBlockMatrix(128, 128)
+    }, dataset.count(), numberOfClasses).toBlockMatrix(1024, 1024)
     val labels = computeLabelProbabilities(distances, toLabel, labeledRows)
     new LabelPropagationModel(extractLabeledPoints(dataset),
       distances,
       labels,
       MatrixUtils.blockToCoordinateMatrix(labels).toIndexedRowMatrix.rows.map {
-        row => (row.index, row.vector.argmax.toDouble)
+        row => (row.index, (row.vector.argmax, row.vector(row.vector.argmax)))
       },
       $(kNeighbours))
   }
@@ -201,7 +201,7 @@ final class LabelPropagationClassifier(override val uid: String)
       val newLabelsRDD = MatrixUtils.blockToCoordinateMatrix(transitionMatrix.multiply(labels)).toIndexedRowMatrix.rows
       val newLabels = new IndexedRowMatrix(oldLabelsRDD ++ newLabelsRDD.filter { case IndexedRow(i, v) =>
           i >= labeledPoints
-        }, labels.numRows(), labels.numCols().toInt).toBlockMatrix(128, 128).persist(StorageLevel.MEMORY_ONLY_SER)
+        }, labels.numRows(), labels.numCols().toInt).toBlockMatrix(1024, 1024).persist(StorageLevel.MEMORY_ONLY_SER)
       //assert(MatrixUtils.hasOnlyValidElements(newLabels))
       if (hasConverged(labels, newLabels, 0.001)) {
         return newLabels
@@ -212,10 +212,10 @@ final class LabelPropagationClassifier(override val uid: String)
 
     val transitionMatrix = new IndexedRowMatrix(weights.toIndexedRowMatrix.rows.map { (row) =>
       //assert(!inverse.isNaN)
-      val sum = 1.0 / row.vector.toSparse.values.sum
-      val divided = row.vector.toSparse.values.map {_ / sum}
-      new IndexedRow(row.index, new SparseVector(row.vector.size, row.vector.toSparse.indices, divided))
-    }, weights.numRows(), weights.numCols().toInt).toBlockMatrix(128, 128).persist(StorageLevel.MEMORY_ONLY_SER)
+      val sum = row.vector.toSparse.values.sum
+      new IndexedRow(row.index, Vectors.sparse(row.vector.size, row.vector.toSparse.indices,
+                     row.vector.toSparse.values.map {_ / sum}))
+    }, weights.numRows(), weights.numCols().toInt).toBlockMatrix(1024, 1024).persist(StorageLevel.MEMORY_ONLY_SER)
     //assert(MatrixUtils.hasOnlyValidElements(transitionMatrix))
     labelPropagationRec(transitionMatrix, labels, 0)
   }
@@ -227,7 +227,7 @@ class LabelPropagationModel(override val uid: String,
                             val points: RDD[LabeledPoint],
                             val weightMatrix: BlockMatrix,
                             val labelWeights: BlockMatrix,
-                            val labels: RDD[(Long, Double)],
+                            val labels: RDD[(Long, (Int, Double))],
                             val k: Int) extends ProbabilisticClassificationModel[Vector, LabelPropagationModel]
   with Serializable with KnnKernel with GraphParams {
   override def numClasses: Int = {
@@ -259,7 +259,7 @@ class LabelPropagationModel(override val uid: String,
 
   override def copy(extra: ParamMap): LabelPropagationModel = defaultCopy(extra)
 
-  def this(points: RDD[LabeledPoint], weightMatrix: BlockMatrix, labelWeights: BlockMatrix, labels: RDD[(Long, Double)],
+  def this(points: RDD[LabeledPoint], weightMatrix: BlockMatrix, labelWeights: BlockMatrix, labels: RDD[(Long, (Int, Double))],
            k: Int) = this(Identifiable.randomUID("lpcm"), points,
     weightMatrix, labelWeights, labels, k)
 

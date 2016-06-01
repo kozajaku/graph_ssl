@@ -43,24 +43,31 @@ final class LabelSpreadingClassifier(override val uid: String) extends GraphClas
       if (iteration > $(maxIterations)) {
         return labels
       }
-      val newLabels = laplacian.multiply(labels).add(mulLabels)
+      val newLabels = laplacian.multiply(labels).add(mulLabels).cache()
       //assert(MatrixUtils.hasOnlyValidElements(newLabels))
       if (hasConverged(labels, newLabels, 0.001)) {
         return newLabels
       }
-      labelSpreadingRec(laplacian, newLabels.cache(), iteration + 1)
+      labelSpreadingRec(laplacian, newLabels, iteration + 1)
     }
 
     val degrees = distances.toIndexedRowMatrix.rows.map { case row =>
-      (row, row.vector.toArray.sum)
+      (row.index, (row.vector, row.vector.toArray.sum))
     }.cache
-    val laplacian = new CoordinateMatrix(degrees.cartesian(degrees).map {case ((IndexedRow(i, v1), d1), (IndexedRow(j, v2), d2)) =>
+
+    val laplacian = new CoordinateMatrix(degrees.cartesian(degrees).filter { case ((i, (v1, d1)), (j, (v2, d2))) =>
+      (i, j) match {
+        case (`j`, _) if v1.numNonzeros > 1 => true
+        case (`i`, `j`) if v1(j.toInt) != 0 && v2(i.toInt) != 0 => true
+        case _ => false
+      }
+    }.map {case ((i, (v1, d1)), (j, (v2, d2))) =>
       new MatrixEntry(i, j, (i, j) match {
         case (`j`, _) if v1.numNonzeros > 1 => $(alpha)
-        case (`i`, `j`) if v1(j.toInt) != 0 && v2(i.toInt) != 0 => $(alpha) / math.sqrt(d1 * d2)
-        case _ => 0.0d
+        case (`i`, `j`) if (v1(j.toInt) !== 0.0 +- 0.0000001) && (v2(i.toInt) !== 0.0 +- 0.0000001) => $(alpha) / math.sqrt(d1 * d2)
       })
-    }.filter {_.value !== 0.0d +- 0.00000000001d}, distances.numRows, distances.numCols).toBlockMatrix(toLabel.rowsPerBlock, toLabel.colsPerBlock).cache()
+    }, distances.numRows,
+              distances.numCols).toBlockMatrix(toLabel.rowsPerBlock, toLabel.colsPerBlock).cache()
     labelSpreadingRec(laplacian, toLabel, 0)
   }
 

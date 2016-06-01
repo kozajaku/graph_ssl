@@ -7,6 +7,7 @@ package cz.cvut.fit.palicand.vocloud.ssl
 import java.io.File
 import cz.cvut.fit.palicand.vocloud.ssl.ml.classification.{GraphClassifier, LabelSpreadingClassifier, LabelPropagationClassifier}
 import cz.cvut.fit.palicand.vocloud.ssl.utils.DataframeUtils
+import org.apache.spark.mllib.linalg.distributed.IndexedRow
 import org.apache.spark.mllib.linalg.{VectorUDT, Vectors, Vector}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Row, SQLContext}
@@ -62,7 +63,7 @@ object GraphSSL extends Logging {
         buffer.append(row.getDouble(j))
       }
       Row.fromSeq(i :: row.getString(0) :: Vectors.dense(buffer.toArray) :: row.getInt(row.length - 1).toDouble :: Nil)
-    }, rowSchema).repartition(jsonConfig.partitions)
+    }, rowSchema).filter(s"label != ${4}") //this shouuuld be more general... we are filtering out class 4 since it is a chaotic class and not really one to bring many information
     //sample the data
     val sampled = sqlContext.createDataFrame(transformed.where("label != -1").unionAll(transformed.where("label = -1").sample(withReplacement = false,
       jsonConfig.ratio)).rdd.zipWithIndex.map {case (row@Row(_, name, features, label), i) => Row.fromSeq(i :: name :: features :: label :: Nil)}, rowSchema).orderBy("rowNo")
@@ -95,9 +96,15 @@ object GraphSSL extends Logging {
       setTopTreeSize(jsonConfig.kernelParameters.topTreeSize)
     clf.setBufferSize(jsonConfig.kernelParameters.bufferSize)
     val model = clf.fit(dataset)
-    val names = dataset.select("rowNo", "spectrum").map{ case Row(rowNo: Long, name: String) =>
-      (rowNo, name)
-    }.join(model.labels).map {case (rowNo, (name, label)) => (name, label)}.saveAsTextFile(jsonConfig.outputData)
+    val names = dataset.select("rowNo", "spectrum", "features").map{ case Row(rowNo: Long, name: String, features: Vector) =>
+      (rowNo, (name, features))
+    }
+    names.join(model.labels).sortBy(_._2._2._2, ascending = false).map {case (rowNo, ((name, features), (label, prob))) => (name, features, label, prob)}.saveAsTextFile(jsonConfig.outputData + "/labels.csv")
+    names.join(model.labelWeights.toIndexedRowMatrix.rows.map {r => (r.index, r.vector.toDense.values)}).map {
+      case (rowNo, (name, vector)) =>
+        s"$name,${vector.mkString(",")}"
+    }.saveAsTextFile(jsonConfig.outputData + "/distribution.csv")
+
   }
 
 
