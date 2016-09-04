@@ -58,14 +58,13 @@ final class LabelSpreadingClassifier(override val uid: String) extends GraphClas
     val laplacian = new CoordinateMatrix(degrees.cartesian(degrees).filter { case ((i, (v1, d1)), (j, (v2, d2))) =>
       (i, j) match {
         case (`j`, _) if v1.numNonzeros > 1 => true
-        //case (`i`, `j`) if v1(j.toInt) != 0 && v2(i.toInt) != 0 => true //hotfix by kozajaku
         case (`i`, `j`) if (v1(j.toInt) !== 0.0 +- 0.0000001) && (v2(i.toInt) !== 0.0 +- 0.0000001) => true
         case _ => false
       }
     }.map {case ((i, (v1, d1)), (j, (v2, d2))) =>
       new MatrixEntry(i, j, (i, j) match {
         case (`j`, _) if v1.numNonzeros > 1 => $(alpha)
-        case (`i`, `j`) /*if (v1(j.toInt) !== 0.0 +- 0.0000001) && (v2(i.toInt) !== 0.0 +- 0.0000001) // not necessary */ => $(alpha) / math.sqrt(d1 * d2)
+        case (`i`, `j`) => $(alpha) / math.sqrt(d1 * d2)
       })
     }, distances.numRows,
               distances.numCols).toBlockMatrix(toLabel.rowsPerBlock, toLabel.colsPerBlock).cache()
